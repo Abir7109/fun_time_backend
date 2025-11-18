@@ -42,7 +42,12 @@ async function main() {
   });
 
   type RoomPlayerColor = "w" | "b" | null;
-  type RoomPlayer = { id: string; username: string; color: RoomPlayerColor; ludoIndex: number | null };
+  type RoomPlayer = {
+    id: string;
+    username: string;
+    color: RoomPlayerColor;
+    ludoIndex: number | null; // 0 = P1, 1 = P2, null = no Ludo role / spectator
+  };
   const roomPlayers = new Map<string, RoomPlayer[]>();
 
   // In-memory chess state per room. For a production setup you could
@@ -76,18 +81,24 @@ async function main() {
       const current = roomPlayers.get(roomCode) || [];
       const withoutThis = current.filter((p) => p.id !== socket.id);
 
-      // Assign chess colors to first two players in the room: white then black.
-      const takenColors = new Set<RoomPlayerColor>(current.map((p) => p.color));
-      let color: RoomPlayerColor = null;
-      if (!takenColors.has("w")) color = "w";
-      else if (!takenColors.has("b")) color = "b";
+      // Assign chess colors: first player in the room becomes white, second becomes black.
+      // If this socket is reconnecting and already has a color, keep it.
+      const existingForSocket = current.find((p) => p.id === socket.id);
+      let color: RoomPlayerColor = existingForSocket?.color ?? null;
 
-      // Assign Ludo indices to first two players (P1: 0, P2: 1). Extra players
-      // become spectators (null index).
-      const takenLudo = new Set<number>(current.map((p) => p.ludoIndex).filter((v): v is number => v != null));
-      let ludoIndex: number | null = null;
-      if (!takenLudo.has(0)) ludoIndex = 0;
-      else if (!takenLudo.has(1)) ludoIndex = 1;
+      if (!color) {
+        // This is a new join (not a reconnect). Assign color based on room size.
+        const takenColors = new Set<RoomPlayerColor>(withoutThis.map((p) => p.color));
+        if (!takenColors.has("w")) {
+          color = "w"; // First player
+        } else if (!takenColors.has("b")) {
+          color = "b"; // Second player
+        }
+        // If both colors are taken, color remains null (spectator, but we'll reject on client).
+      }
+
+      // Ludo roles removed but kept in data structure for compatibility.
+      const ludoIndex: number | null = existingForSocket?.ludoIndex ?? null;
 
       const updatedPlayers: RoomPlayer[] = [
         ...withoutThis,
@@ -114,13 +125,45 @@ async function main() {
       io.to(roomCode).emit("chat", { from: socket.data.username, msg });
     });
 
-    // Ludo synchronization: in this version the client is authoritative and
-    // sends full state snapshots; the server simply relays them to all
-    // sockets in the same room.
+    // Ludo: clients are authoritative for now and send full state snapshots;
+    // the server simply relays them to all sockets in the same room.
     socket.on("ludo_state", (roomCode: string, state: unknown) => {
       roomCode = (roomCode || "").trim().toUpperCase();
       if (!roomCode || roomCode.length !== 6 || !state) return;
       io.to(roomCode).emit("ludo_state", state);
+    });
+
+    // Ludo role selection: a client chooses which index (0 or 1) they control.
+    // We enforce uniqueness so only one socket can be each player.
+    socket.on("ludo_choose_role", (roomCode: string, index: number | null) => {
+      roomCode = (roomCode || "").trim().toUpperCase();
+      if (!roomCode || roomCode.length !== 6) return;
+
+      const playersInRoom = roomPlayers.get(roomCode) || [];
+      const meIndex = playersInRoom.findIndex((p) => p.id === socket.id);
+      if (meIndex === -1) return;
+
+      const clampedIndex: number | null = index === 0 || index === 1 ? index : null;
+
+      if (clampedIndex !== null) {
+        const takenByOther = playersInRoom.some(
+          (p) => p.id !== socket.id && p.ludoIndex === clampedIndex,
+        );
+        if (takenByOther) {
+          // Role already taken; re-send the caller's current role so their UI stays in sync.
+          socket.emit("ludo_role", { index: playersInRoom[meIndex].ludoIndex ?? null });
+          return;
+        }
+      }
+
+      playersInRoom[meIndex] = {
+        ...playersInRoom[meIndex],
+        ludoIndex: clampedIndex,
+      };
+      roomPlayers.set(roomCode, playersInRoom);
+      broadcastPlayers(roomCode);
+
+      socket.emit("ludo_role", { index: clampedIndex });
     });
 
     // Chess synchronization: server holds a Chess instance per room and

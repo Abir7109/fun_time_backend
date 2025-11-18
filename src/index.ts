@@ -42,7 +42,7 @@ async function main() {
   });
 
   type RoomPlayerColor = "w" | "b" | null;
-  type RoomPlayer = { id: string; username: string; color: RoomPlayerColor };
+  type RoomPlayer = { id: string; username: string; color: RoomPlayerColor; ludoIndex: number | null };
   const roomPlayers = new Map<string, RoomPlayer[]>();
 
   // In-memory chess state per room. For a production setup you could
@@ -82,14 +82,25 @@ async function main() {
       if (!takenColors.has("w")) color = "w";
       else if (!takenColors.has("b")) color = "b";
 
-      const updatedPlayers: RoomPlayer[] = [...withoutThis, { id: socket.id, username, color }];
+      // Assign Ludo indices to first two players (P1: 0, P2: 1). Extra players
+      // become spectators (null index).
+      const takenLudo = new Set<number>(current.map((p) => p.ludoIndex).filter((v): v is number => v != null));
+      let ludoIndex: number | null = null;
+      if (!takenLudo.has(0)) ludoIndex = 0;
+      else if (!takenLudo.has(1)) ludoIndex = 1;
+
+      const updatedPlayers: RoomPlayer[] = [
+        ...withoutThis,
+        { id: socket.id, username, color, ludoIndex },
+      ];
       roomPlayers.set(roomCode, updatedPlayers);
 
       io.to(roomCode).emit("system", `${username} joined room ${roomCode}`);
       broadcastPlayers(roomCode);
 
-      // Tell this socket which chess color it controls (if any).
+      // Tell this socket which chess color / ludo index it controls (if any).
       socket.emit("chess_role", { color });
+      socket.emit("ludo_role", { index: ludoIndex });
 
       // If there is an existing chess game for this room, send the current
       // position to the newly joined client so they see the live board.
@@ -101,6 +112,15 @@ async function main() {
 
     socket.on("chat", (roomCode: string, msg: string) => {
       io.to(roomCode).emit("chat", { from: socket.data.username, msg });
+    });
+
+    // Ludo synchronization: in this version the client is authoritative and
+    // sends full state snapshots; the server simply relays them to all
+    // sockets in the same room.
+    socket.on("ludo_state", (roomCode: string, state: unknown) => {
+      roomCode = (roomCode || "").trim().toUpperCase();
+      if (!roomCode || roomCode.length !== 6 || !state) return;
+      io.to(roomCode).emit("ludo_state", state);
     });
 
     // Chess synchronization: server holds a Chess instance per room and

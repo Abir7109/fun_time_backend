@@ -81,6 +81,14 @@ async function main() {
       const current = roomPlayers.get(roomCode) || [];
       const withoutThis = current.filter((p) => p.id !== socket.id);
 
+      console.log(`[${roomCode}] Player joining:`, {
+        socketId: socket.id,
+        username,
+        currentPlayersCount: current.length,
+        playersWithoutThis: withoutThis.length,
+        existingPlayers: current.map(p => ({ id: p.id, color: p.color })),
+      });
+
       // Assign chess colors: first player in the room becomes white, second becomes black.
       // If this socket is reconnecting and already has a color, keep it.
       const existingForSocket = current.find((p) => p.id === socket.id);
@@ -89,12 +97,19 @@ async function main() {
       if (!color) {
         // This is a new join (not a reconnect). Assign color based on room size.
         const takenColors = new Set<RoomPlayerColor>(withoutThis.map((p) => p.color));
+        console.log(`[${roomCode}] Assigning new color. Taken colors:`, Array.from(takenColors));
         if (!takenColors.has("w")) {
           color = "w"; // First player
+          console.log(`[${roomCode}] Assigned WHITE to ${username}`);
         } else if (!takenColors.has("b")) {
           color = "b"; // Second player
+          console.log(`[${roomCode}] Assigned BLACK to ${username}`);
+        } else {
+          console.log(`[${roomCode}] Room is FULL. ${username} joins as spectator (null color)`);
         }
         // If both colors are taken, color remains null (spectator, but we'll reject on client).
+      } else {
+        console.log(`[${roomCode}] ${username} reconnecting with existing color: ${color}`);
       }
 
       // Ludo roles removed but kept in data structure for compatibility.

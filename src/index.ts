@@ -41,7 +41,8 @@ async function main() {
     },
   });
 
-  type RoomPlayer = { id: string; username: string };
+  type RoomPlayerColor = "w" | "b" | null;
+  type RoomPlayer = { id: string; username: string; color: RoomPlayerColor };
   const roomPlayers = new Map<string, RoomPlayer[]>();
 
   // In-memory chess state per room. For a production setup you could
@@ -74,10 +75,21 @@ async function main() {
 
       const current = roomPlayers.get(roomCode) || [];
       const withoutThis = current.filter((p) => p.id !== socket.id);
-      roomPlayers.set(roomCode, [...withoutThis, { id: socket.id, username }]);
+
+      // Assign chess colors to first two players in the room: white then black.
+      const takenColors = new Set<RoomPlayerColor>(current.map((p) => p.color));
+      let color: RoomPlayerColor = null;
+      if (!takenColors.has("w")) color = "w";
+      else if (!takenColors.has("b")) color = "b";
+
+      const updatedPlayers: RoomPlayer[] = [...withoutThis, { id: socket.id, username, color }];
+      roomPlayers.set(roomCode, updatedPlayers);
 
       io.to(roomCode).emit("system", `${username} joined room ${roomCode}`);
       broadcastPlayers(roomCode);
+
+      // Tell this socket which chess color it controls (if any).
+      socket.emit("chess_role", { color });
 
       // If there is an existing chess game for this room, send the current
       // position to the newly joined client so they see the live board.
@@ -103,6 +115,17 @@ async function main() {
         if (!roomCode || roomCode.length !== 6 || !payload) return;
 
         const game = getOrCreateChessGame(roomCode);
+
+        // Enforce that only the player whose color is to move can make a move.
+        const playersInRoom = roomPlayers.get(roomCode) || [];
+        const me = playersInRoom.find((p) => p.id === socket.id);
+        const myColor = me?.color ?? null;
+        const turn = game.turn() as RoomPlayerColor;
+        if (!myColor || myColor !== turn) {
+          socket.emit("chess_invalid", payload);
+          return;
+        }
+
         try {
           const move = game.move({
             from: payload.from,

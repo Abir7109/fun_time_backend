@@ -45,6 +45,7 @@ async function main() {
   type RoomPlayer = {
     id: string;
     username: string;
+    usernameNormalized: string;
     color: RoomPlayerColor;
     ludoIndex: number | null; // 0 = P1, 1 = P2, null = no Ludo role / spectator
   };
@@ -78,8 +79,13 @@ async function main() {
       socket.data.username = username;
       socket.data.roomCode = roomCode;
 
+      const normalizedUsername = username.trim().toLowerCase();
+
       const current = roomPlayers.get(roomCode) || [];
       const withoutThis = current.filter((p) => p.id !== socket.id);
+      const withoutDuplicateUser = withoutThis.filter(
+        (p) => p.usernameNormalized !== normalizedUsername,
+      );
 
       console.log(`[${roomCode}] Player joining:`, {
         socketId: socket.id,
@@ -92,11 +98,16 @@ async function main() {
       // Assign chess colors: first player in the room becomes white, second becomes black.
       // If this socket is reconnecting and already has a color, keep it.
       const existingForSocket = current.find((p) => p.id === socket.id);
-      let color: RoomPlayerColor = existingForSocket?.color ?? null;
+      const existingForUsername = current.find(
+        (p) => p.usernameNormalized === normalizedUsername,
+      );
+      let color: RoomPlayerColor = existingForSocket?.color ?? existingForUsername?.color ?? null;
 
       if (!color) {
         // This is a new join (not a reconnect). Assign color based on room size.
-        const takenColors = new Set<RoomPlayerColor>(withoutThis.map((p) => p.color));
+        const takenColors = new Set<RoomPlayerColor>(
+          withoutDuplicateUser.map((p) => p.color),
+        );
         console.log(`[${roomCode}] Assigning new color. Taken colors:`, Array.from(takenColors));
         if (!takenColors.has("w")) {
           color = "w"; // First player
@@ -113,11 +124,12 @@ async function main() {
       }
 
       // Ludo roles removed but kept in data structure for compatibility.
-      const ludoIndex: number | null = existingForSocket?.ludoIndex ?? null;
+      const ludoIndex: number | null =
+        existingForSocket?.ludoIndex ?? existingForUsername?.ludoIndex ?? null;
 
       const updatedPlayers: RoomPlayer[] = [
-        ...withoutThis,
-        { id: socket.id, username, color, ludoIndex },
+        ...withoutDuplicateUser,
+        { id: socket.id, username, usernameNormalized: normalizedUsername, color, ludoIndex },
       ];
       roomPlayers.set(roomCode, updatedPlayers);
 
@@ -222,6 +234,15 @@ async function main() {
         io.to(roomCode).emit("chess_position", { fen: game.fen() });
       },
     );
+
+    socket.on("chess_request_state", (roomCode: string) => {
+      roomCode = (roomCode || "").trim().toUpperCase();
+      if (!roomCode || roomCode.length !== 6) return;
+      const existing = chessGames.get(roomCode);
+      if (existing) {
+        socket.emit("chess_position", { fen: existing.fen() });
+      }
+    });
 
     socket.on("chess_reset", (roomCode: string) => {
       roomCode = (roomCode || "").trim().toUpperCase();

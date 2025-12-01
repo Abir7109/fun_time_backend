@@ -55,6 +55,47 @@ async function main() {
   // persist this in MongoDB keyed by roomCode.
   const chessGames = new Map<string, Chess>();
 
+  // In-memory Tic Tac Toe state per room.
+  type TttCell = "X" | "O" | null;
+  interface TttState {
+    board: TttCell[];
+    next: "X" | "O" | null;
+    winner: "X" | "O" | "draw" | null;
+  }
+  const tttGames = new Map<string, TttState>();
+
+  function getOrCreateTttState(roomCode: string): TttState {
+    const existing = tttGames.get(roomCode);
+    if (existing) return existing;
+    const fresh: TttState = {
+      board: Array(9).fill(null),
+      next: "X",
+      winner: null,
+    };
+    tttGames.set(roomCode, fresh);
+    return fresh;
+  }
+
+  function computeTttWinner(board: TttCell[]): TttState["winner"] {
+    const lines = [
+      [0, 1, 2],
+      [3, 4, 5],
+      [6, 7, 8],
+      [0, 3, 6],
+      [1, 4, 7],
+      [2, 5, 8],
+      [0, 4, 8],
+      [2, 4, 6],
+    ];
+    for (const [a, b, c] of lines) {
+      if (board[a] && board[a] === board[b] && board[a] === board[c]) {
+        return board[a];
+      }
+    }
+    if (board.every((c) => c)) return "draw";
+    return null;
+  }
+
   function broadcastPlayers(roomCode: string) {
     const players = roomPlayers.get(roomCode) || [];
     io.to(roomCode).emit("room_players", players);
@@ -136,8 +177,9 @@ async function main() {
       io.to(roomCode).emit("system", `${username} joined room ${roomCode}`);
       broadcastPlayers(roomCode);
 
-      // Tell this socket which chess color / ludo index it controls (if any).
+      // Tell this socket which chess color / ttt symbol / ludo index it controls (if any).
       socket.emit("chess_role", { color });
+      socket.emit("tictactoe_role", { symbol: null });
       socket.emit("ludo_role", { index: ludoIndex });
 
       // If there is an existing chess game for this room, send the current
@@ -191,6 +233,55 @@ async function main() {
       broadcastPlayers(roomCode);
 
       socket.emit("ludo_role", { index: clampedIndex });
+    });
+
+    // Tic Tac Toe: simple 3x3 board with X/O turns.
+    socket.on("tictactoe_move", (roomCode: string, index: number) => {
+      roomCode = (roomCode || "").trim().toUpperCase();
+      if (!roomCode || roomCode.length !== 6) return;
+      const game = getOrCreateTttState(roomCode);
+      if (game.winner || game.next == null) return;
+      if (index < 0 || index > 8) return;
+      if (game.board[index]) return;
+
+      const playersInRoom = roomPlayers.get(roomCode) || [];
+      const me = playersInRoom.find((p) => p.id === socket.id);
+      if (!me) return;
+
+      const mySymbol: "X" | "O" | null = (() => {
+        // First player in room is X, second is O.
+        const ordered = playersInRoom.filter((p) => p.usernameNormalized);
+        const xId = ordered[0]?.id;
+        const oId = ordered[1]?.id;
+        if (socket.id === xId) return "X";
+        if (socket.id === oId) return "O";
+        return null;
+      })();
+
+      if (!mySymbol || mySymbol !== game.next) return;
+
+      game.board[index] = mySymbol;
+      game.winner = computeTttWinner(game.board);
+      game.next = game.winner ? null : mySymbol === "X" ? "O" : "X";
+
+      io.to(roomCode).emit("tictactoe_state", game);
+    });
+
+    socket.on("tictactoe_request_state", (roomCode: string) => {
+      roomCode = (roomCode || "").trim().toUpperCase();
+      if (!roomCode || roomCode.length !== 6) return;
+      const game = getOrCreateTttState(roomCode);
+      socket.emit("tictactoe_state", game);
+    });
+
+    socket.on("tictactoe_reset", (roomCode: string) => {
+      roomCode = (roomCode || "").trim().toUpperCase();
+      if (!roomCode || roomCode.length !== 6) return;
+      const fresh = getOrCreateTttState(roomCode);
+      fresh.board = Array(9).fill(null);
+      fresh.next = "X";
+      fresh.winner = null;
+      io.to(roomCode).emit("tictactoe_state", fresh);
     });
 
     // Chess synchronization: server holds a Chess instance per room and

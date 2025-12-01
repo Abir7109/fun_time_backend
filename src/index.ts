@@ -5,6 +5,13 @@ import cors from "cors";
 import dotenv from "dotenv";
 import mongoose from "mongoose";
 import { Chess } from "chess.js";
+import type {
+  CarromBoardState,
+  CarromPlayerId,
+  CarromShotPayload,
+  CarromCoin,
+  Vec2,
+} from "./carromTypes";
 
 dotenv.config();
 
@@ -63,6 +70,138 @@ async function main() {
     winner: "X" | "O" | "draw" | null;
   }
   const tttGames = new Map<string, TttState>();
+
+  // In-memory Carrom state per room.
+  const carromGames = new Map<string, CarromBoardState>();
+
+  const BOARD_SIZE = 1; // normalized 0..1
+  const STRIKER_RADIUS = 0.035;
+  const COIN_RADIUS = 0.025;
+  const POCKET_RADIUS = 0.07;
+
+  function v(x: number, y: number): Vec2 {
+    return { x, y };
+  }
+
+  function dist2(a: Vec2, b: Vec2): number {
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return dx * dx + dy * dy;
+  }
+
+  const POCKETS: Vec2[] = [
+    v(0.02, 0.02),
+    v(0.98, 0.02),
+    v(0.02, 0.98),
+    v(0.98, 0.98),
+  ];
+
+  function createInitialCarromCoins(roomCode: string): CarromCoin[] {
+    const coins: CarromCoin[] = [];
+    const center = v(0.5, 0.5);
+    const offsets: Vec2[] = [
+      v(0, 0),
+      v(COIN_RADIUS * 2, 0),
+      v(-COIN_RADIUS * 2, 0),
+      v(0, COIN_RADIUS * 2),
+      v(0, -COIN_RADIUS * 2),
+      v(COIN_RADIUS * 1.6, COIN_RADIUS * 1.6),
+      v(-COIN_RADIUS * 1.6, COIN_RADIUS * 1.6),
+      v(COIN_RADIUS * 1.6, -COIN_RADIUS * 1.6),
+      v(-COIN_RADIUS * 1.6, -COIN_RADIUS * 1.6),
+    ];
+
+    // Queen in exact center.
+    coins.push({
+      id: `${roomCode}-queen`,
+      color: "queen",
+      owner: null,
+      position: center,
+      velocity: v(0, 0),
+      radius: COIN_RADIUS,
+      pocketed: false,
+    });
+
+    // Nine white, nine black around.
+    for (let i = 0; i < 9; i++) {
+      const off = offsets[i % offsets.length];
+      const baseId = `${roomCode}-coin-${i}`;
+      const white: CarromCoin = {
+        id: `${baseId}-w`,
+        color: "white",
+        owner: "A",
+        position: v(center.x + off.x * 0.6, center.y + off.y * 0.6),
+        velocity: v(0, 0),
+        radius: COIN_RADIUS,
+        pocketed: false,
+      };
+      const black: CarromCoin = {
+        id: `${baseId}-b`,
+        color: "black",
+        owner: "B",
+        position: v(center.x + off.x * 1.1, center.y + off.y * 1.1),
+        velocity: v(0, 0),
+        radius: COIN_RADIUS,
+        pocketed: false,
+      };
+      coins.push(white, black);
+    }
+
+    return coins;
+  }
+
+  function getOrCreateCarromState(roomCode: string, players: RoomPlayer[]): CarromBoardState {
+    const existing = carromGames.get(roomCode);
+    if (existing) return existing;
+
+    const pAId: CarromPlayerId = "A";
+    const pBId: CarromPlayerId = "B";
+    const firstTwo = players.slice(0, 2);
+    const nameA = firstTwo[0]?.username || "Player A";
+    const nameB = firstTwo[1]?.username || "Player B";
+
+    const coins = createInitialCarromCoins(roomCode);
+
+    const state: CarromBoardState = {
+      roomCode,
+      coins,
+      striker: {
+        position: v(0.5, 0.1),
+        velocity: v(0, 0),
+        radius: STRIKER_RADIUS,
+      },
+      currentPlayer: pAId,
+      players: {
+        [pAId]: {
+          id: pAId,
+          username: nameA,
+          colorSet: "white",
+          score: 0,
+          fouls: 0,
+          coinsPocketed: 0,
+          queenCovered: false,
+        },
+        [pBId]: {
+          id: pBId,
+          username: nameB,
+          colorSet: "black",
+          score: 0,
+          fouls: 0,
+          coinsPocketed: 0,
+          queenCovered: false,
+        },
+      },
+      breakDone: false,
+      pendingQueenCoverFor: null,
+      turnPhase: "aiming",
+      boardNumber: 1,
+      maxBoards: 8,
+      winnerPlayer: null,
+    };
+
+    carromGames.set(roomCode, state);
+    return state;
+  }
 
   function getOrCreateTttState(roomCode: string): TttState {
     const existing = tttGames.get(roomCode);
@@ -201,6 +340,222 @@ async function main() {
 
     socket.on("chat", (roomCode: string, msg: string) => {
       io.to(roomCode).emit("chat", { from: socket.data.username, msg });
+    });
+
+    // Carrom: basic synchronized state with server as authority for turns.
+    socket.on("carrom_request_state", (roomCode: string) => {
+      roomCode = (roomCode || "").trim().toUpperCase();
+      if (!roomCode || roomCode.length !== 6) return;
+      const playersInRoom = roomPlayers.get(roomCode) || [];
+      const state = getOrCreateCarromState(roomCode, playersInRoom);
+      socket.emit("carrom_state", state);
+    });
+
+    socket.on("carrom_shot", (roomCode: string, payload: CarromShotPayload | null) => {
+      roomCode = (roomCode || "").trim().toUpperCase();
+      if (!roomCode || roomCode.length !== 6 || !payload) return;
+      const playersInRoom = roomPlayers.get(roomCode) || [];
+      const state = getOrCreateCarromState(roomCode, playersInRoom);
+
+      const meIdx = playersInRoom.findIndex((p) => p.id === socket.id);
+      if (meIdx === -1) return;
+      const myId: CarromPlayerId = meIdx === 0 ? "A" : meIdx === 1 ? "B" : null as any;
+      if (!myId || state.currentPlayer !== myId || state.turnPhase !== "aiming") return;
+
+      const angle = payload.angle;
+      const power = Math.max(0, Math.min(1, payload.power));
+      const speed = 1.8 * power; // tuned later
+      state.striker.position = { x: payload.baselineX, y: myId === "A" ? 0.1 : 0.9 };
+      state.striker.velocity = { x: Math.cos(angle) * speed, y: Math.sin(angle) * speed };
+      state.turnPhase = "moving";
+
+      const dt = 0.016;
+      const friction = 0.985;
+      const steps = 260;
+      const shotPocketed: CarromCoin[] = [];
+      let strikerPocketed = false;
+
+      for (let i = 0; i < steps; i++) {
+        // Advance striker.
+        state.striker.position.x += state.striker.velocity.x * dt;
+        state.striker.position.y += state.striker.velocity.y * dt;
+        state.striker.velocity.x *= friction;
+        state.striker.velocity.y *= friction;
+
+        // Bounce off walls.
+        if (
+          state.striker.position.x - STRIKER_RADIUS < 0 ||
+          state.striker.position.x + STRIKER_RADIUS > BOARD_SIZE
+        ) {
+          state.striker.velocity.x *= -0.7;
+        }
+        if (
+          state.striker.position.y - STRIKER_RADIUS < 0 ||
+          state.striker.position.y + STRIKER_RADIUS > BOARD_SIZE
+        ) {
+          state.striker.velocity.y *= -0.7;
+        }
+
+        // Striker-pocket detection.
+        if (!strikerPocketed) {
+          for (const p of POCKETS) {
+            if (dist2(state.striker.position, p) < POCKET_RADIUS * POCKET_RADIUS) {
+              strikerPocketed = true;
+              state.striker.velocity = v(0, 0);
+              break;
+            }
+          }
+        }
+
+        // Advance coins.
+        for (const coin of state.coins) {
+          if (coin.pocketed) continue;
+          // Simple collision with striker.
+          const dx = coin.position.x - state.striker.position.x;
+          const dy = coin.position.y - state.striker.position.y;
+          const rSum = coin.radius + STRIKER_RADIUS;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > 0 && d2 < rSum * rSum) {
+            const d = Math.sqrt(d2);
+            const nx = dx / d;
+            const ny = dy / d;
+            const relVx = state.striker.velocity.x;
+            const relVy = state.striker.velocity.y;
+            const relDot = relVx * nx + relVy * ny;
+            if (relDot > 0) {
+              const impulse = relDot;
+              coin.velocity.x += nx * impulse * 0.8;
+              coin.velocity.y += ny * impulse * 0.8;
+              state.striker.velocity.x -= nx * impulse * 0.6;
+              state.striker.velocity.y -= ny * impulse * 0.6;
+            }
+          }
+
+          // Move coin.
+          coin.position.x += coin.velocity.x * dt;
+          coin.position.y += coin.velocity.y * dt;
+          coin.velocity.x *= friction;
+          coin.velocity.y *= friction;
+
+          // Wall bounce for coins.
+          if (
+            coin.position.x - COIN_RADIUS < 0 ||
+            coin.position.x + COIN_RADIUS > BOARD_SIZE
+          ) {
+            coin.velocity.x *= -0.7;
+          }
+          if (
+            coin.position.y - COIN_RADIUS < 0 ||
+            coin.position.y + COIN_RADIUS > BOARD_SIZE
+          ) {
+            coin.velocity.y *= -0.7;
+          }
+
+          // Pocket detection for coins.
+          for (const p of POCKETS) {
+            if (dist2(coin.position, p) < POCKET_RADIUS * POCKET_RADIUS) {
+              coin.pocketed = true;
+              coin.velocity = v(0, 0);
+              shotPocketed.push(coin);
+              break;
+            }
+          }
+        }
+      }
+
+      state.turnPhase = "resolving";
+
+      const mePlayer = state.players[myId];
+      const otherId: CarromPlayerId = myId === "A" ? "B" : "A";
+      const otherPlayer = state.players[otherId];
+
+      let ownPocketedThisShot = 0;
+      let oppPocketedThisShot = 0;
+      let queenPocketedThisShot = false;
+
+      for (const coin of shotPocketed) {
+        if (coin.color === "queen") {
+          queenPocketedThisShot = true;
+          state.pendingQueenCoverFor = myId;
+        } else if (coin.owner === myId) {
+          ownPocketedThisShot++;
+          mePlayer.coinsPocketed += 1;
+          mePlayer.score += 1;
+        } else if (coin.owner === otherId) {
+          oppPocketedThisShot++;
+          otherPlayer.coinsPocketed += 1;
+          otherPlayer.score += 1;
+        }
+      }
+
+      // Queen cover logic.
+      if (state.pendingQueenCoverFor === myId) {
+        if (ownPocketedThisShot > 0) {
+          mePlayer.queenCovered = true;
+          mePlayer.score += 5;
+          state.pendingQueenCoverFor = null;
+        }
+      }
+
+      // If queen was pending from a previous turn and player failed again, return queen.
+      if (state.pendingQueenCoverFor === myId && ownPocketedThisShot === 0 && !queenPocketedThisShot) {
+        const queen = state.coins.find((c) => c.color === "queen");
+        if (queen) {
+          queen.pocketed = false;
+          queen.position = v(0.5, 0.5);
+          queen.velocity = v(0, 0);
+        }
+        state.pendingQueenCoverFor = null;
+        mePlayer.queenCovered = false;
+      }
+
+      // Striker foul.
+      if (strikerPocketed) {
+        mePlayer.fouls += 1;
+        // Return one of player's own pocketed coins (not queen) if any.
+        const returned = state.coins.find(
+          (c) => c.owner === myId && c.pocketed && c.color !== "queen",
+        );
+        if (returned) {
+          returned.pocketed = false;
+          returned.position = v(0.5, 0.5);
+          returned.velocity = v(0, 0);
+          mePlayer.coinsPocketed = Math.max(0, mePlayer.coinsPocketed - 1);
+          mePlayer.score = Math.max(0, mePlayer.score - 1);
+        }
+      }
+
+      // Determine if player gets another turn.
+      let keepTurn = false;
+      if (!strikerPocketed && (ownPocketedThisShot > 0 || queenPocketedThisShot)) {
+        keepTurn = true;
+      }
+
+      if (!keepTurn) {
+        state.currentPlayer = otherId;
+      }
+
+      // Winner detection: a player with all 9 of their coins pocketed and queen covered.
+      const aState = state.players["A"];
+      const bState = state.players["B"];
+      const aAll = aState.coinsPocketed >= 9 && aState.queenCovered;
+      const bAll = bState.coinsPocketed >= 9 && bState.queenCovered;
+      if (aAll || bAll) {
+        state.winnerPlayer = aAll && !bAll ? "A" : !aAll && bAll ? "B" : null;
+      }
+
+      state.turnPhase = "aiming";
+
+      io.to(roomCode).emit("carrom_state", state);
+    });
+
+    socket.on("carrom_reset", (roomCode: string) => {
+      roomCode = (roomCode || "").trim().toUpperCase();
+      if (!roomCode || roomCode.length !== 6) return;
+      const playersInRoom = roomPlayers.get(roomCode) || [];
+      const fresh = getOrCreateCarromState(roomCode, playersInRoom);
+      carromGames.set(roomCode, fresh);
+      io.to(roomCode).emit("carrom_state", fresh);
     });
 
     // Ludo: clients are authoritative for now and send full state snapshots;

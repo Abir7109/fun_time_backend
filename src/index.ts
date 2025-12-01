@@ -179,7 +179,16 @@ async function main() {
 
       // Tell this socket which chess color / ttt symbol / ludo index it controls (if any).
       socket.emit("chess_role", { color });
-      socket.emit("tictactoe_role", { symbol: null });
+
+      // Tic Tac Toe: first active player is X, second is O.
+      const orderedForTtt = updatedPlayers.filter((p) => p.usernameNormalized);
+      const xId = orderedForTtt[0]?.id;
+      const oId = orderedForTtt[1]?.id;
+      let tttSymbol: "X" | "O" | null = null;
+      if (socket.id === xId) tttSymbol = "X";
+      else if (socket.id === oId) tttSymbol = "O";
+      socket.emit("tictactoe_role", { symbol: tttSymbol });
+
       socket.emit("ludo_role", { index: ludoIndex });
 
       // If there is an existing chess game for this room, send the current

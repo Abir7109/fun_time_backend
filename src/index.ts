@@ -5,13 +5,6 @@ import cors from "cors";
 import dotenv from "dotenv";
 import mongoose from "mongoose";
 import { Chess } from "chess.js";
-import type {
-  CarromBoardState,
-  CarromPlayerId,
-  CarromShotPayload,
-  CarromCoin,
-  Vec2,
-} from "./carromTypes";
 
 dotenv.config();
 
@@ -56,7 +49,29 @@ async function main() {
     color: RoomPlayerColor;
     ludoIndex: number | null; // 0 = P1, 1 = P2, null = no Ludo role / spectator
   };
+
+  type GameKey = "chess" | "tictactoe" | "connect4";
+
   const roomPlayers = new Map<string, RoomPlayer[]>();
+  const roomGames = new Map<string, GameKey>();
+
+  function parseGameKey(value: string | null | undefined): GameKey | null {
+    const v = (value || "").trim();
+    if (v === "chess" || v === "tictactoe" || v === "connect4") return v;
+    return null;
+  }
+
+  function getOrSetRoomGame(
+    roomCode: string,
+    suggestedGameKey?: string | null,
+  ): GameKey {
+    const existing = roomGames.get(roomCode);
+    if (existing) return existing;
+    const parsed = parseGameKey(suggestedGameKey ?? null);
+    const resolved: GameKey = parsed ?? "chess";
+    roomGames.set(roomCode, resolved);
+    return resolved;
+  }
 
   // In-memory chess state per room. For a production setup you could
   // persist this in MongoDB keyed by roomCode.
@@ -71,137 +86,15 @@ async function main() {
   }
   const tttGames = new Map<string, TttState>();
 
-  // In-memory Carrom state per room.
-  const carromGames = new Map<string, CarromBoardState>();
-
-  const BOARD_SIZE = 1; // normalized 0..1
-  const STRIKER_RADIUS = 0.035;
-  const COIN_RADIUS = 0.025;
-  const POCKET_RADIUS = 0.07;
-
-  function v(x: number, y: number): Vec2 {
-    return { x, y };
+  // In-memory Connect Four state per room.
+  type C4Cell = "R" | "Y" | null;
+  interface C4State {
+    // 7 columns x 6 rows board, stored column-major: index = col * 6 + row.
+    board: C4Cell[];
+    next: "R" | "Y" | null;
+    winner: "R" | "Y" | "draw" | null;
   }
-
-  function dist2(a: Vec2, b: Vec2): number {
-    const dx = a.x - b.x;
-    const dy = a.y - b.y;
-    return dx * dx + dy * dy;
-  }
-
-  const POCKETS: Vec2[] = [
-    v(0.02, 0.02),
-    v(0.98, 0.02),
-    v(0.02, 0.98),
-    v(0.98, 0.98),
-  ];
-
-  function createInitialCarromCoins(roomCode: string): CarromCoin[] {
-    const coins: CarromCoin[] = [];
-    const center = v(0.5, 0.5);
-    const offsets: Vec2[] = [
-      v(0, 0),
-      v(COIN_RADIUS * 2, 0),
-      v(-COIN_RADIUS * 2, 0),
-      v(0, COIN_RADIUS * 2),
-      v(0, -COIN_RADIUS * 2),
-      v(COIN_RADIUS * 1.6, COIN_RADIUS * 1.6),
-      v(-COIN_RADIUS * 1.6, COIN_RADIUS * 1.6),
-      v(COIN_RADIUS * 1.6, -COIN_RADIUS * 1.6),
-      v(-COIN_RADIUS * 1.6, -COIN_RADIUS * 1.6),
-    ];
-
-    // Queen in exact center.
-    coins.push({
-      id: `${roomCode}-queen`,
-      color: "queen",
-      owner: null,
-      position: center,
-      velocity: v(0, 0),
-      radius: COIN_RADIUS,
-      pocketed: false,
-    });
-
-    // Nine white, nine black around.
-    for (let i = 0; i < 9; i++) {
-      const off = offsets[i % offsets.length];
-      const baseId = `${roomCode}-coin-${i}`;
-      const white: CarromCoin = {
-        id: `${baseId}-w`,
-        color: "white",
-        owner: "A",
-        position: v(center.x + off.x * 0.6, center.y + off.y * 0.6),
-        velocity: v(0, 0),
-        radius: COIN_RADIUS,
-        pocketed: false,
-      };
-      const black: CarromCoin = {
-        id: `${baseId}-b`,
-        color: "black",
-        owner: "B",
-        position: v(center.x + off.x * 1.1, center.y + off.y * 1.1),
-        velocity: v(0, 0),
-        radius: COIN_RADIUS,
-        pocketed: false,
-      };
-      coins.push(white, black);
-    }
-
-    return coins;
-  }
-
-  function getOrCreateCarromState(roomCode: string, players: RoomPlayer[]): CarromBoardState {
-    const existing = carromGames.get(roomCode);
-    if (existing) return existing;
-
-    const pAId: CarromPlayerId = "A";
-    const pBId: CarromPlayerId = "B";
-    const firstTwo = players.slice(0, 2);
-    const nameA = firstTwo[0]?.username || "Player A";
-    const nameB = firstTwo[1]?.username || "Player B";
-
-    const coins = createInitialCarromCoins(roomCode);
-
-    const state: CarromBoardState = {
-      roomCode,
-      coins,
-      striker: {
-        position: v(0.5, 0.1),
-        velocity: v(0, 0),
-        radius: STRIKER_RADIUS,
-      },
-      currentPlayer: pAId,
-      players: {
-        [pAId]: {
-          id: pAId,
-          username: nameA,
-          colorSet: "white",
-          score: 0,
-          fouls: 0,
-          coinsPocketed: 0,
-          queenCovered: false,
-        },
-        [pBId]: {
-          id: pBId,
-          username: nameB,
-          colorSet: "black",
-          score: 0,
-          fouls: 0,
-          coinsPocketed: 0,
-          queenCovered: false,
-        },
-      },
-      breakDone: false,
-      pendingQueenCoverFor: null,
-      turnPhase: "aiming",
-      boardNumber: 1,
-      maxBoards: 8,
-      winnerPlayer: null,
-    };
-
-    carromGames.set(roomCode, state);
-    return state;
-  }
+  const c4Games = new Map<string, C4State>();
 
   function getOrCreateTttState(roomCode: string): TttState {
     const existing = tttGames.get(roomCode);
@@ -235,6 +128,59 @@ async function main() {
     return null;
   }
 
+  function getOrCreateC4State(roomCode: string): C4State {
+    const existing = c4Games.get(roomCode);
+    if (existing) return existing;
+    const fresh: C4State = {
+      board: Array(7 * 6).fill(null),
+      next: "R",
+      winner: null,
+    };
+    c4Games.set(roomCode, fresh);
+    return fresh;
+  }
+
+  function computeC4Winner(board: C4Cell[]): C4State["winner"] {
+    const width = 7;
+    const height = 6;
+    const directions = [
+      { dx: 1, dy: 0 }, // horizontal
+      { dx: 0, dy: 1 }, // vertical
+      { dx: 1, dy: 1 }, // diag down-right
+      { dx: 1, dy: -1 }, // diag up-right
+    ];
+
+    const get = (x: number, y: number): C4Cell | null => {
+      if (x < 0 || x >= width || y < 0 || y >= height) return null;
+      return board[x * height + y];
+    };
+
+    for (let x = 0; x < width; x++) {
+      for (let y = 0; y < height; y++) {
+        const cell = get(x, y);
+        if (!cell) continue;
+        for (const { dx, dy } of directions) {
+          let count = 1;
+          for (let step = 1; step < 4; step++) {
+            const nx = x + dx * step;
+            const ny = y + dy * step;
+            if (get(nx, ny) === cell) {
+              count++;
+            } else {
+              break;
+            }
+          }
+          if (count >= 4) {
+            return cell;
+          }
+        }
+      }
+    }
+
+    if (board.every((c) => c)) return "draw";
+    return null;
+  }
+
   function broadcastPlayers(roomCode: string) {
     const players = roomPlayers.get(roomCode) || [];
     io.to(roomCode).emit("room_players", players);
@@ -251,13 +197,19 @@ async function main() {
   io.on("connection", (socket) => {
     console.log("🔌 client connected", socket.id);
 
-    socket.on("join_room", (roomCode: string, username: string) => {
-      roomCode = (roomCode || "").trim().toUpperCase();
-      if (!roomCode || roomCode.length !== 6) return;
+    socket.on(
+      "join_room",
+      (roomCode: string, username: string, gameKeyRaw?: string | null) => {
+        roomCode = (roomCode || "").trim().toUpperCase();
+        if (!roomCode || roomCode.length !== 6) return;
 
-      socket.join(roomCode);
-      socket.data.username = username;
-      socket.data.roomCode = roomCode;
+        socket.join(roomCode);
+        socket.data.username = username;
+        socket.data.roomCode = roomCode;
+
+        // Determine the canonical game for this room and notify this socket.
+        const roomGame = getOrSetRoomGame(roomCode, gameKeyRaw ?? null);
+        socket.emit("room_game", { game: roomGame });
 
       const normalizedUsername = username.trim().toLowerCase();
 
@@ -328,6 +280,15 @@ async function main() {
       else if (socket.id === oId) tttSymbol = "O";
       socket.emit("tictactoe_role", { symbol: tttSymbol });
 
+      // Connect Four: first active player is Red (R), second is Yellow (Y).
+      const orderedForC4 = orderedForTtt;
+      const rId = orderedForC4[0]?.id;
+      const yId = orderedForC4[1]?.id;
+      let c4Symbol: "R" | "Y" | null = null;
+      if (socket.id === rId) c4Symbol = "R";
+      else if (socket.id === yId) c4Symbol = "Y";
+      socket.emit("connect4_role", { symbol: c4Symbol });
+
       socket.emit("ludo_role", { index: ludoIndex });
 
       // If there is an existing chess game for this room, send the current
@@ -343,220 +304,7 @@ async function main() {
     });
 
     // Carrom: basic synchronized state with server as authority for turns.
-    socket.on("carrom_request_state", (roomCode: string) => {
-      roomCode = (roomCode || "").trim().toUpperCase();
-      if (!roomCode || roomCode.length !== 6) return;
-      const playersInRoom = roomPlayers.get(roomCode) || [];
-      const state = getOrCreateCarromState(roomCode, playersInRoom);
-      socket.emit("carrom_state", state);
-    });
-
-    socket.on("carrom_shot", (roomCode: string, payload: CarromShotPayload | null) => {
-      roomCode = (roomCode || "").trim().toUpperCase();
-      if (!roomCode || roomCode.length !== 6 || !payload) return;
-      const playersInRoom = roomPlayers.get(roomCode) || [];
-      const state = getOrCreateCarromState(roomCode, playersInRoom);
-
-      const meIdx = playersInRoom.findIndex((p) => p.id === socket.id);
-      if (meIdx === -1) return;
-      const myId: CarromPlayerId = meIdx === 0 ? "A" : meIdx === 1 ? "B" : null as any;
-      if (!myId || state.currentPlayer !== myId || state.turnPhase !== "aiming") return;
-
-      const angle = payload.angle;
-      const power = Math.max(0, Math.min(1, payload.power));
-      const speed = 1.8 * power; // tuned later
-      state.striker.position = { x: payload.baselineX, y: myId === "A" ? 0.1 : 0.9 };
-      state.striker.velocity = { x: Math.cos(angle) * speed, y: Math.sin(angle) * speed };
-      state.turnPhase = "moving";
-
-      const dt = 0.016;
-      const friction = 0.985;
-      const steps = 260;
-      const shotPocketed: CarromCoin[] = [];
-      let strikerPocketed = false;
-
-      for (let i = 0; i < steps; i++) {
-        // Advance striker.
-        state.striker.position.x += state.striker.velocity.x * dt;
-        state.striker.position.y += state.striker.velocity.y * dt;
-        state.striker.velocity.x *= friction;
-        state.striker.velocity.y *= friction;
-
-        // Bounce off walls.
-        if (
-          state.striker.position.x - STRIKER_RADIUS < 0 ||
-          state.striker.position.x + STRIKER_RADIUS > BOARD_SIZE
-        ) {
-          state.striker.velocity.x *= -0.7;
-        }
-        if (
-          state.striker.position.y - STRIKER_RADIUS < 0 ||
-          state.striker.position.y + STRIKER_RADIUS > BOARD_SIZE
-        ) {
-          state.striker.velocity.y *= -0.7;
-        }
-
-        // Striker-pocket detection.
-        if (!strikerPocketed) {
-          for (const p of POCKETS) {
-            if (dist2(state.striker.position, p) < POCKET_RADIUS * POCKET_RADIUS) {
-              strikerPocketed = true;
-              state.striker.velocity = v(0, 0);
-              break;
-            }
-          }
-        }
-
-        // Advance coins.
-        for (const coin of state.coins) {
-          if (coin.pocketed) continue;
-          // Simple collision with striker.
-          const dx = coin.position.x - state.striker.position.x;
-          const dy = coin.position.y - state.striker.position.y;
-          const rSum = coin.radius + STRIKER_RADIUS;
-          const d2 = dx * dx + dy * dy;
-          if (d2 > 0 && d2 < rSum * rSum) {
-            const d = Math.sqrt(d2);
-            const nx = dx / d;
-            const ny = dy / d;
-            const relVx = state.striker.velocity.x;
-            const relVy = state.striker.velocity.y;
-            const relDot = relVx * nx + relVy * ny;
-            if (relDot > 0) {
-              const impulse = relDot;
-              coin.velocity.x += nx * impulse * 0.8;
-              coin.velocity.y += ny * impulse * 0.8;
-              state.striker.velocity.x -= nx * impulse * 0.6;
-              state.striker.velocity.y -= ny * impulse * 0.6;
-            }
-          }
-
-          // Move coin.
-          coin.position.x += coin.velocity.x * dt;
-          coin.position.y += coin.velocity.y * dt;
-          coin.velocity.x *= friction;
-          coin.velocity.y *= friction;
-
-          // Wall bounce for coins.
-          if (
-            coin.position.x - COIN_RADIUS < 0 ||
-            coin.position.x + COIN_RADIUS > BOARD_SIZE
-          ) {
-            coin.velocity.x *= -0.7;
-          }
-          if (
-            coin.position.y - COIN_RADIUS < 0 ||
-            coin.position.y + COIN_RADIUS > BOARD_SIZE
-          ) {
-            coin.velocity.y *= -0.7;
-          }
-
-          // Pocket detection for coins.
-          for (const p of POCKETS) {
-            if (dist2(coin.position, p) < POCKET_RADIUS * POCKET_RADIUS) {
-              coin.pocketed = true;
-              coin.velocity = v(0, 0);
-              shotPocketed.push(coin);
-              break;
-            }
-          }
-        }
-      }
-
-      state.turnPhase = "resolving";
-
-      const mePlayer = state.players[myId];
-      const otherId: CarromPlayerId = myId === "A" ? "B" : "A";
-      const otherPlayer = state.players[otherId];
-
-      let ownPocketedThisShot = 0;
-      let oppPocketedThisShot = 0;
-      let queenPocketedThisShot = false;
-
-      for (const coin of shotPocketed) {
-        if (coin.color === "queen") {
-          queenPocketedThisShot = true;
-          state.pendingQueenCoverFor = myId;
-        } else if (coin.owner === myId) {
-          ownPocketedThisShot++;
-          mePlayer.coinsPocketed += 1;
-          mePlayer.score += 1;
-        } else if (coin.owner === otherId) {
-          oppPocketedThisShot++;
-          otherPlayer.coinsPocketed += 1;
-          otherPlayer.score += 1;
-        }
-      }
-
-      // Queen cover logic.
-      if (state.pendingQueenCoverFor === myId) {
-        if (ownPocketedThisShot > 0) {
-          mePlayer.queenCovered = true;
-          mePlayer.score += 5;
-          state.pendingQueenCoverFor = null;
-        }
-      }
-
-      // If queen was pending from a previous turn and player failed again, return queen.
-      if (state.pendingQueenCoverFor === myId && ownPocketedThisShot === 0 && !queenPocketedThisShot) {
-        const queen = state.coins.find((c) => c.color === "queen");
-        if (queen) {
-          queen.pocketed = false;
-          queen.position = v(0.5, 0.5);
-          queen.velocity = v(0, 0);
-        }
-        state.pendingQueenCoverFor = null;
-        mePlayer.queenCovered = false;
-      }
-
-      // Striker foul.
-      if (strikerPocketed) {
-        mePlayer.fouls += 1;
-        // Return one of player's own pocketed coins (not queen) if any.
-        const returned = state.coins.find(
-          (c) => c.owner === myId && c.pocketed && c.color !== "queen",
-        );
-        if (returned) {
-          returned.pocketed = false;
-          returned.position = v(0.5, 0.5);
-          returned.velocity = v(0, 0);
-          mePlayer.coinsPocketed = Math.max(0, mePlayer.coinsPocketed - 1);
-          mePlayer.score = Math.max(0, mePlayer.score - 1);
-        }
-      }
-
-      // Determine if player gets another turn.
-      let keepTurn = false;
-      if (!strikerPocketed && (ownPocketedThisShot > 0 || queenPocketedThisShot)) {
-        keepTurn = true;
-      }
-
-      if (!keepTurn) {
-        state.currentPlayer = otherId;
-      }
-
-      // Winner detection: a player with all 9 of their coins pocketed and queen covered.
-      const aState = state.players["A"];
-      const bState = state.players["B"];
-      const aAll = aState.coinsPocketed >= 9 && aState.queenCovered;
-      const bAll = bState.coinsPocketed >= 9 && bState.queenCovered;
-      if (aAll || bAll) {
-        state.winnerPlayer = aAll && !bAll ? "A" : !aAll && bAll ? "B" : null;
-      }
-
-      state.turnPhase = "aiming";
-
-      io.to(roomCode).emit("carrom_state", state);
-    });
-
-    socket.on("carrom_reset", (roomCode: string) => {
-      roomCode = (roomCode || "").trim().toUpperCase();
-      if (!roomCode || roomCode.length !== 6) return;
-      const playersInRoom = roomPlayers.get(roomCode) || [];
-      const fresh = getOrCreateCarromState(roomCode, playersInRoom);
-      carromGames.set(roomCode, fresh);
-      io.to(roomCode).emit("carrom_state", fresh);
-    });
+    // (Carrom game removed)
 
     // Ludo: clients are authoritative for now and send full state snapshots;
     // the server simply relays them to all sockets in the same room.
@@ -648,6 +396,68 @@ async function main() {
       io.to(roomCode).emit("tictactoe_state", fresh);
     });
 
+    // Connect Four: 7x6 vertical grid with gravity.
+    socket.on("connect4_move", (roomCode: string, colIndex: number) => {
+      roomCode = (roomCode || "").trim().toUpperCase();
+      if (!roomCode || roomCode.length !== 6) return;
+      if (colIndex < 0 || colIndex > 6) return;
+      const game = getOrCreateC4State(roomCode);
+      if (game.winner || game.next == null) return;
+
+      const playersInRoom = roomPlayers.get(roomCode) || [];
+      const me = playersInRoom.find((p) => p.id === socket.id);
+      if (!me) return;
+
+      const mySymbol: "R" | "Y" | null = (() => {
+        // First player is R, second is Y.
+        const ordered = playersInRoom.filter((p) => p.usernameNormalized);
+        const rId = ordered[0]?.id;
+        const yId = ordered[1]?.id;
+        if (socket.id === rId) return "R";
+        if (socket.id === yId) return "Y";
+        return null;
+      })();
+
+      if (!mySymbol || mySymbol !== game.next) return;
+
+      const width = 7;
+      const height = 6;
+      const board = game.board;
+      // Find lowest empty slot in the selected column.
+      let placedRow: number | null = null;
+      for (let row = 0; row < height; row++) {
+        const idx = colIndex * height + row;
+        if (!board[idx]) {
+          board[idx] = mySymbol;
+          placedRow = row;
+          break;
+        }
+      }
+      if (placedRow == null) return; // column full
+
+      game.winner = computeC4Winner(board);
+      game.next = game.winner ? null : mySymbol === "R" ? "Y" : "R";
+
+      io.to(roomCode).emit("connect4_state", game);
+    });
+
+    socket.on("connect4_request_state", (roomCode: string) => {
+      roomCode = (roomCode || "").trim().toUpperCase();
+      if (!roomCode || roomCode.length !== 6) return;
+      const game = getOrCreateC4State(roomCode);
+      socket.emit("connect4_state", game);
+    });
+
+    socket.on("connect4_reset", (roomCode: string) => {
+      roomCode = (roomCode || "").trim().toUpperCase();
+      if (!roomCode || roomCode.length !== 6) return;
+      const fresh = getOrCreateC4State(roomCode);
+      fresh.board = Array(7 * 6).fill(null);
+      fresh.next = "R";
+      fresh.winner = null;
+      io.to(roomCode).emit("connect4_state", fresh);
+    });
+
     // Chess synchronization: server holds a Chess instance per room and
     // applies moves sent by clients, then broadcasts the resulting FEN.
     socket.on(
@@ -712,7 +522,13 @@ async function main() {
       (roomCode: string, config?: { players?: number; game?: string }) => {
         roomCode = (roomCode || "").trim().toUpperCase();
         if (!roomCode || roomCode.length !== 6) return;
-        io.to(roomCode).emit("game_started", config);
+
+        // Resolve the canonical game for this room based on any existing mapping
+        // or the requested config, then broadcast it.
+        const resolved = getOrSetRoomGame(roomCode, config?.game ?? null);
+
+        io.to(roomCode).emit("room_game", { game: resolved });
+        io.to(roomCode).emit("game_started", { ...config, game: resolved });
       },
     );
 
@@ -723,6 +539,11 @@ async function main() {
         const updated = current.filter((p) => p.id !== socket.id);
         if (updated.length === 0) {
           roomPlayers.delete(roomCode);
+          // Clean up any in-memory game state when a room is fully empty.
+          chessGames.delete(roomCode);
+          tttGames.delete(roomCode);
+          c4Games.delete(roomCode);
+          roomGames.delete(roomCode);
         } else {
           roomPlayers.set(roomCode, updated);
         }
